@@ -7,6 +7,10 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time
+import warnings
+import ast
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Load environment variables
 load_dotenv()
@@ -14,8 +18,59 @@ load_dotenv()
 # Cache for poster URLs to avoid repeated API calls
 poster_cache = {}
 
-with open('movie_dict.pkl','rb') as file:
-    movies,cosine_sim=pickle.load(file)
+# Load pickle file with compatibility handling
+def load_or_create_pickle():
+    """Load pickle file, or recreate it from CSV if incompatible"""
+    try:
+        with open('movie_dict.pkl','rb') as file:
+            return pickle.load(file)
+    except Exception as e:
+        # If pickle loading fails, recreate from CSV files
+        print(f"Pickle load failed ({e}), regenerating from CSV files...")
+        
+        # Load CSV files
+        credits = pd.read_csv('tmdb_5000_credits.csv')
+        movies_df = pd.read_csv('tmdb_5000_movies.csv')
+        
+        # Merge
+        movies_df = movies_df.merge(credits, left_on='title', right_on='title')
+        
+        # Select columns
+        movies_df = movies_df[['movie_id','title','overview','genres','keywords','cast','crew']]
+        
+        # Convert to lists
+        def convert(obj):
+            L = []
+            try:
+                for i in ast.literal_eval(obj):
+                    L.append(i['name']) 
+            except:
+                pass
+            return L
+        
+        movies_df['genres'] = movies_df['genres'].apply(convert)
+        movies_df['keywords'] = movies_df['keywords'].apply(convert)
+        movies_df['cast'] = movies_df['cast'].apply(lambda x: [i['name'] for i in ast.literal_eval(x)[0:3]] if isinstance(x, str) else [])
+        movies_df['crew'] = movies_df['crew'].apply(lambda x: [i['name'] for i in ast.literal_eval(x) if i['job']=='Director'] if isinstance(x, str) else [])
+        
+        # Create tags
+        movies_df['tags'] = movies_df['genres'] + movies_df['keywords'] + movies_df['cast'] + movies_df['crew']
+        movies_df = movies_df[['movie_id','title','overview','tags']]
+        movies_df['tags'] = movies_df['tags'].apply(lambda x: " ".join(x).lower())
+        
+        # Create cosine similarity
+        tfidf = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = tfidf.fit_transform(movies_df['tags'])
+        cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+        
+        # Save pickle with current pandas version
+        with open('movie_dict.pkl', 'wb') as file:
+            pickle.dump((movies_df, cosine_sim), file)
+        
+        print("Pickle file regenerated successfully")
+        return movies_df, cosine_sim
+
+movies, cosine_sim = load_or_create_pickle()
 
 def create_session_with_retries(retries=5, backoff_factor=2, timeout=15):
     """Create a requests session with retry strategy"""
