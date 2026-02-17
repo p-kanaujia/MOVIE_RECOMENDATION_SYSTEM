@@ -3,4 +3,4 @@
 __pycache__
 *.pyc
 .DS_Store
-.streamlit/secrets.toml
+.streamlit/secrets.tomlmovie_dict.pkl
