@@ -3,12 +3,11 @@ import pandas as pd
 import requests
 import pickle
 import os
+import ast
+import time
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import time
-import warnings
-import ast
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -16,29 +15,32 @@ from sklearn.metrics.pairwise import cosine_similarity
 load_dotenv()
 
 # Cache for poster URLs to avoid repeated API calls
-poster_cache = {}
+if 'poster_cache' not in st.session_state:
+    st.session_state.poster_cache = {}
 
-# Load pickle file with compatibility handling
-def load_or_create_pickle():
-    """Load pickle file, or recreate it from CSV if incompatible"""
+@st.cache_data
+def load_data():
+    """
+    Load data with caching to prevent reloading on every interaction.
+    If pickle exists, use it. Otherwise, process CSVs.
+    """
+    pickle_path = 'movie_dict.pkl'
+    
+    if os.path.exists(pickle_path):
+        try:
+            with open(pickle_path, 'rb') as file:
+                return pickle.load(file)
+        except Exception as e:
+            st.warning(f"Pickle corrupted, falling back to CSV: {e}")
+
+    # Fallback to CSV Processing
     try:
-        with open('movie_dict.pkl','rb') as file:
-            return pickle.load(file)
-    except Exception as e:
-        # If pickle loading fails, recreate from CSV files
-        print(f"Pickle load failed ({e}), regenerating from CSV files...")
-        
-        # Load CSV files
         credits = pd.read_csv('tmdb_5000_credits.csv')
         movies_df = pd.read_csv('tmdb_5000_movies.csv')
         
-        # Merge
-        movies_df = movies_df.merge(credits, left_on='title', right_on='title')
-        
-        # Select columns
+        movies_df = movies_df.merge(credits, on='title')
         movies_df = movies_df[['movie_id','title','overview','genres','keywords','cast','crew']]
         
-        # Convert to lists
         def convert(obj):
             L = []
             try:
@@ -53,113 +55,73 @@ def load_or_create_pickle():
         movies_df['cast'] = movies_df['cast'].apply(lambda x: [i['name'] for i in ast.literal_eval(x)[0:3]] if isinstance(x, str) else [])
         movies_df['crew'] = movies_df['crew'].apply(lambda x: [i['name'] for i in ast.literal_eval(x) if i['job']=='Director'] if isinstance(x, str) else [])
         
-        # Create tags
         movies_df['tags'] = movies_df['genres'] + movies_df['keywords'] + movies_df['cast'] + movies_df['crew']
         movies_df = movies_df[['movie_id','title','overview','tags']]
         movies_df['tags'] = movies_df['tags'].apply(lambda x: " ".join(x).lower())
         
-        # Create cosine similarity
         tfidf = TfidfVectorizer(stop_words='english')
         tfidf_matrix = tfidf.fit_transform(movies_df['tags'])
         cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
         
-        # Save pickle with current pandas version
-        with open('movie_dict.pkl', 'wb') as file:
-            pickle.dump((movies_df, cosine_sim), file)
-        
-        print("Pickle file regenerated successfully")
         return movies_df, cosine_sim
+    except FileNotFoundError:
+        st.error("Data files missing! Please ensure CSVs are in the repository.")
+        return None, None
 
-movies, cosine_sim = load_or_create_pickle()
-
-def create_session_with_retries(retries=5, backoff_factor=2, timeout=15):
-    """Create a requests session with retry strategy"""
+def create_session():
     session = requests.Session()
     retry_strategy = Retry(
-        total=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504]
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
-def get_recommendations(title,cosine_sim=cosine_sim):
-    idx = movies[movies['title'] == title].index[0]
-    sim_scores = list(enumerate(cosine_sim[idx]))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-    sim_scores = sim_scores[1:6] #get top 5 similar movies
-    movie_indices = [i[0] for i in sim_scores]
-    return movies[['title','movie_id']].iloc[movie_indices]
-
-def fetch_poster(movie_id, max_retries=5):
-    """Fetch poster URL from TMDB API with retry logic and caching"""
-    global poster_cache
-    
-    # Check cache first
-    if movie_id in poster_cache:
-        return poster_cache[movie_id]
+def fetch_poster(movie_id):
+    if movie_id in st.session_state.poster_cache:
+        return st.session_state.poster_cache[movie_id]
     
     api_key = os.getenv('TMDB_API_KEY')
-    
     if not api_key:
-        print("WARNING: TMDB_API_KEY not found in environment variables")
-        placeholder = "https://via.placeholder.com/500x750?text=No+Image"
-        poster_cache[movie_id] = placeholder
-        return placeholder
+        return "https://via.placeholder.com/500x750?text=Set+API+Key"
     
     url = f'https://api.themoviedb.org/3/movie/{movie_id}?api_key={api_key}'
-    session = create_session_with_retries(retries=max_retries, backoff_factor=2)
-    
     try:
-        # Add delay to avoid rate limiting (0.25 seconds between requests)
-        time.sleep(0.25)
-        
-        response = session.get(url, timeout=15)
-        response.raise_for_status()
+        session = create_session()
+        response = session.get(url, timeout=5)
         data = response.json()
-        if 'poster_path' in data and data['poster_path']:
-            poster_path = data['poster_path']
-            full_path = f"https://image.tmdb.org/t/p/w500/{poster_path}"
-            poster_cache[movie_id] = full_path
+        path = data.get('poster_path')
+        if path:
+            full_path = f"https://image.tmdb.org/t/p/w500/{path}"
+            st.session_state.poster_cache[movie_id] = full_path
             return full_path
-        else:
-            placeholder = "https://via.placeholder.com/500x750?text=No+Image"
-            poster_cache[movie_id] = placeholder
-            return placeholder
-    except requests.exceptions.Timeout:
-        print(f"Timeout error for movie_id {movie_id} - retrying with increased timeout")
-        placeholder = "https://via.placeholder.com/500x750?text=No+Image"
-        poster_cache[movie_id] = placeholder
-        return placeholder
-    except requests.exceptions.ConnectionError as e:
-        print(f"Connection error for movie_id {movie_id}: {e}")
-        placeholder = "https://via.placeholder.com/500x750?text=No+Image"
-        poster_cache[movie_id] = placeholder
-        return placeholder
-    except requests.exceptions.RequestException as e:
-        print(f"Request error for movie_id {movie_id}: {e}")
-        placeholder = "https://via.placeholder.com/500x750?text=No+Image"
-        poster_cache[movie_id] = placeholder
-        return placeholder
-    finally:
-        session.close()
+    except:
+        pass
+    return "https://via.placeholder.com/500x750?text=No+Image"
 
-st.title('Movie Recommendation System')
-select_movie_name=st.selectbox('Select a movie from the list',movies['title'].values)
-if st.button('Recommend'):
-    recommendations=get_recommendations(select_movie_name)
-    st.write('Top 5 similar movies to '+select_movie_name)
-    
-    #creating a grid 1X5 layout
-    cols=st.columns(5)
-    for col,j in zip(cols,range(5)):
-        if j<len(recommendations):
-            movie_title=recommendations.iloc[j]['title']
-            movie_id=recommendations.iloc[j]['movie_id']
-            poster_url=fetch_poster(movie_id)
+def get_recommendations(title, movies, cosine_sim):
+    idx = movies[movies['title'] == title].index[0]
+    sim_scores = sorted(list(enumerate(cosine_sim[idx])), key=lambda x: x[1], reverse=True)
+    movie_indices = [i[0] for i in sim_scores[1:6]]
+    return movies.iloc[movie_indices]
+
+# App Execution
+movies, cosine_sim = load_data()
+
+if movies is not None:
+    st.title('Movie Recommender')
+    selected_movie = st.selectbox('Type or select a movie', movies['title'].values)
+
+    if st.button('Show Recommendations'):
+        recs = get_recommendations(selected_movie, movies, cosine_sim)
+        cols = st.columns(5)
+        
+        for i, col in enumerate(cols):
             with col:
-                st.image(poster_url,width=130)
-                st.write(movie_title)
+                movie_id = recs.iloc[i]['movie_id']
+                title = recs.iloc[i]['title']
+                poster = fetch_poster(movie_id)
+                st.image(poster)
+                st.caption(title)
